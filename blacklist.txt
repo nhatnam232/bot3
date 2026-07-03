@@ -1,0 +1,6 @@
+# blacklist.txt — Mỗi dòng 1 từ/cụm từ bị cấm (global, áp dụng mọi guild)
+# Dòng bắt đầu bằng # là comment, bị bỏ qua
+# Thêm từ cấm per-guild qua lệnh /blacklist add
+# Ví dụ:
+# tucamvidu1
+# tucamvidu2
