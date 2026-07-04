@@ -21,6 +21,7 @@ GHI CHÚ /play:
   * Dán link YouTube/SoundCloud/Spotify -> Lavalink tự xử lý.
   * Ghim nền tảng bằng đuôi: 'tên bài -yt' / '-sc' / '-spotify'.
   * Chỉ ghi tên -> mặc định tìm trên YouTube.
+  * Nếu link là PLAYLIST -> bot hỏi muốn XÁO TRỘN hay GIỮ THỨ TỠ.
 
 GHI CHÚ /randomplaylist:
   * Đưa LINK PLAYLIST (Spotify/YouTube/SoundCloud) hoặc tên -> bot tải cả
@@ -204,6 +205,74 @@ class MusicControls(discord.ui.View):
         await interaction.response.send_message(embed=self.cog._queue_embed(player), ephemeral=True)
 
 
+# ============================================================
+# 🎶 PROMPT KHI PHÁT HIỆN PLAYLIST (hỏi xáo trộn / giữ thứ tự)
+# ============================================================
+class PlaylistPrompt(discord.ui.View):
+    def __init__(self, cog, player, tracks, name, author_id):
+        super().__init__(timeout=60)
+        self.cog = cog
+        self.player = player
+        self.tracks = tracks
+        self.name = name
+        self.author_id = author_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "❌ Chỉ người gọi lệnh mới chọn được.", ephemeral=True)
+            return False
+        return True
+
+    def _disable_all(self):
+        for child in self.children:
+            child.disabled = True
+
+    async def _enqueue(self, interaction: discord.Interaction, shuffle: bool):
+        tracks = list(self.tracks)
+        if shuffle:
+            random.shuffle(tracks)
+        added = await self.player.queue.put_wait(tracks)
+        if not self.player.playing:
+            await self.player.play(self.player.queue.get(), volume=40)
+        self._disable_all()
+        mode = "🔀 đã xáo trộn" if shuffle else "➡️ giữ thứ tự"
+        embed = discord.Embed(
+            title="🎶 Đã thêm playlist",
+            description=f"**{self.name}**\nĐã thêm **{added}** bài ({mode}).\n"
+                        f"Bắt đầu: **{tracks[0].title}**",
+            color=0x9b59b6)
+        await interaction.response.edit_message(embed=embed, view=self)
+        self.stop()
+        await interaction.followup.send(
+            embed=self.cog._queue_embed(self.player), view=MusicControls(self.cog))
+
+    @discord.ui.button(emoji="🔀", label="Xáo trộn rồi phát", style=discord.ButtonStyle.success)
+    async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._enqueue(interaction, True)
+
+    @discord.ui.button(emoji="➡️", label="Giữ thứ tự", style=discord.ButtonStyle.primary)
+    async def keep_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._enqueue(interaction, False)
+
+    @discord.ui.button(emoji="✖️", label="Hủy", style=discord.ButtonStyle.danger)
+    async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self._disable_all()
+        # Nếu bot vừa kết nối mà không phát gì + không 24/7 -> rời voice
+        try:
+            if (not self.player.playing and self.player.queue.is_empty
+                    and not await self.cog._is_247(interaction.guild.id)):
+                await self.player.disconnect()
+        except Exception:
+            pass
+        await interaction.response.edit_message(
+            content="✖️ Đã hủy.", embed=None, view=self)
+        self.stop()
+
+    async def on_timeout(self):
+        self._disable_all()
+
+
 class Music(commands.Cog):
     """Cog nhạc qua Lavalink + treo voice 24/7 + panel."""
 
@@ -316,26 +385,6 @@ class Music(commands.Cog):
         embed.add_field(name="Lặp", value=mode_txt)
         embed.add_field(name="Âm lượng", value=f"{player.volume}%")
         return embed
-
-    async def _play_core(self, guild, channel, query):
-        """Kết nối + tìm + phát/xếp hàng. Trả về (track|None, err|None)."""
-        if not self._node_ok():
-            return None, "node"
-        player = await self._connect(guild, channel)
-        if not player:
-            return None, "voice"
-        results = await self._search(query)
-        if not results:
-            return None, "notfound"
-        if isinstance(results, wavelink.Playlist):
-            await player.queue.put_wait(results)
-            track = results.tracks[0] if results.tracks else None
-        else:
-            track = results[0]
-            await player.queue.put_wait(track)
-        if not player.playing:
-            await player.play(player.queue.get(), volume=40)
-        return track, None
 
     async def _play_random(self, guild, channel):
         """Phát 1 bài ngẫu nhiên (seed sẵn). Trả về (track|None, err|None)."""
@@ -484,9 +533,30 @@ class Music(commands.Cog):
             return await interaction.response.send_message(
                 "❌ Chọn 1 voice channel hoặc vào voice trước.", ephemeral=True)
         await interaction.response.defer()
-        track, err = await self._play_core(interaction.guild, target, query)
-        if err:
-            return await interaction.followup.send(self._msg(err))
+        if not self._node_ok():
+            return await interaction.followup.send(NODE_ERR)
+        player = await self._connect(interaction.guild, target)
+        if not player:
+            return await interaction.followup.send(VOICE_ERR)
+        results = await self._search(query)
+        if not results:
+            return await interaction.followup.send(NOTFOUND)
+        # 🎶 Phát hiện PLAYLIST (>1 bài) -> hỏi xáo trộn hay giữ thứ tự
+        if isinstance(results, wavelink.Playlist) and len(results.tracks) > 1:
+            tracks = list(results.tracks)
+            name = getattr(results, "name", None) or "Playlist"
+            embed = discord.Embed(
+                title="🎶 Phát hiện playlist",
+                description=f"**{name}**\nCó **{len(tracks)}** bài. Bạn muốn **xáo trộn** "
+                            f"hay **giữ thứ tự**?",
+                color=0x9b59b6)
+            view = PlaylistPrompt(self, player, tracks, name, interaction.user.id)
+            return await interaction.followup.send(embed=embed, view=view)
+        # 1 bài / kết quả tìm kiếm
+        track = results.tracks[0] if isinstance(results, wavelink.Playlist) else results[0]
+        await player.queue.put_wait(track)
+        if not player.playing:
+            await player.play(player.queue.get(), volume=40)
         await interaction.followup.send(embed=self._embed(track), view=MusicControls(self))
 
     @app_commands.command(name="randomsong", description="Phát 1 bài nhạc ngẫu nhiên")
@@ -523,8 +593,7 @@ class Music(commands.Cog):
         note = "" if is_playlist else "\n_(Không phải link playlist — mình xáo trộn kết quả tìm được.)_"
         embed = discord.Embed(
             title="🔀 Playlist đã xáo trộn",
-            description=f"Đã thêm **{added}** bài (đã trộn ngẫu nhiên) vào hàng đợi.\n"
-                        f"Bắt đầu: **{first.title}**{note}",
+            description=f"Đã thêm **{added}** bài (đã trộn ngẫu nhiên) vào hàng đợi.\nBắt đầu: **{first.title}**{note}",
             color=0x9b59b6)
         await interaction.followup.send(embed=embed, view=MusicControls(self))
 
@@ -627,10 +696,30 @@ class Music(commands.Cog):
         target = await self._target_channel(ctx.guild, ctx.author)
         if not target:
             return await ctx.send("❌ Vào voice hoặc bật 24/7 trước đã.")
+        if not self._node_ok():
+            return await ctx.send(NODE_ERR)
+        player = await self._connect(ctx.guild, target)
+        if not player:
+            return await ctx.send(VOICE_ERR)
         msg = await ctx.send(f"🔎 Đang tìm: **{query}**...")
-        track, err = await self._play_core(ctx.guild, target, query)
-        if err:
-            return await msg.edit(content=self._msg(err))
+        results = await self._search(query)
+        if not results:
+            return await msg.edit(content=NOTFOUND)
+        if isinstance(results, wavelink.Playlist):
+            tracks = list(results.tracks)
+            added = await player.queue.put_wait(tracks)
+            first = tracks[0]
+            if not player.playing:
+                await player.play(player.queue.get(), volume=40)
+            await msg.edit(
+                content=f"🎶 Đã thêm playlist **{getattr(results, 'name', 'Playlist')}** ({added} bài, giữ thứ tự). "
+                        f"Muốn xáo trộn thì dùng `/randomplaylist`.",
+                embed=self._embed(first), view=MusicControls(self))
+            return
+        track = results[0]
+        await player.queue.put_wait(track)
+        if not player.playing:
+            await player.play(player.queue.get(), volume=40)
         await msg.edit(content=None, embed=self._embed(track), view=MusicControls(self))
 
     @commands.command(name="srandomsong")
