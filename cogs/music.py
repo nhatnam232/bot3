@@ -4,6 +4,7 @@ cogs/music.py — 24/7 Voice + Phát nhạc SoundCloud.
 - /play <query> — phát nhạc SoundCloud (search hoặc link trực tiếp)
 - /skip, /stop, /nowplaying — điều khiển hàng đợi
 - Dùng yt-dlp (hỗ trợ soundcloud) + FFmpeg để stream audio
+- FFmpeg lấy từ imageio-ffmpeg (cài qua pip/uv) vì container không có ffmpeg hệ thống
 - Lưu cấu hình 24/7 per-guild vào SQLite qua db.get_config/set_config
 """
 
@@ -22,6 +23,16 @@ try:
     YTDLP_OK = True
 except ImportError:
     YTDLP_OK = False
+
+# FFmpeg: lấy binary từ imageio-ffmpeg (cài qua pip/uv). Nếu không có thì
+# fallback về "ffmpeg" trong PATH (host có sẵn ffmpeg hệ thống).
+try:
+    import imageio_ffmpeg
+    FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
+    log.info("Dùng ffmpeg từ imageio-ffmpeg: %s", FFMPEG_EXE)
+except Exception:
+    FFMPEG_EXE = "ffmpeg"
+    log.warning("Không tìm thấy imageio-ffmpeg, dùng 'ffmpeg' trong PATH")
 
 # ============================================================
 # ⚙️ CẤU HÌNH yt-dlp + FFmpeg
@@ -85,7 +96,7 @@ class MusicPlayer:
                 continue
 
             source = discord.PCMVolumeTransformer(
-                discord.FFmpegPCMAudio(track.url, **FFMPEG_OPTS),
+                discord.FFmpegPCMAudio(track.url, executable=FFMPEG_EXE, **FFMPEG_OPTS),
                 volume=self.volume,
             )
             vc.play(source, after=lambda e: self.cog.bot.loop.call_soon_threadsafe(self.next.set))

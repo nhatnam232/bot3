@@ -16,7 +16,8 @@ import importlib.util
 # ============================================================
 # 📦 AUTO-INSTALL THƯ VIỆN — chạy TRƯỚC khi import discord
 # Check từng package: đã cài → bỏ qua, thiếu → pip install
-# Deploy lên host mới / deploy lại đều tự cài, không cần làm gì
+# (Trên container dùng uv: uv đã cài sẵn từ requirements.txt nên bước này
+#  thường bỏ qua; chỉ hữu ích khi chạy python main.py trực tiếp)
 # ============================================================
 # (tên import, tên package trên pip)
 REQUIRED_PACKAGES = [
@@ -25,6 +26,7 @@ REQUIRED_PACKAGES = [
     ("aiohttp", "aiohttp>=3.8.0"),
     ("yt_dlp", "yt-dlp>=2024.1.0"),
     ("nacl", "PyNaCl>=1.5.0"),
+    ("imageio_ffmpeg", "imageio-ffmpeg>=0.5.1"),
 ]
 
 
