@@ -18,8 +18,9 @@ Ghi chú /play:
   * Spotify không stream trực tiếp (DRM) -> lấy metadata rồi tìm trên YouTube
     (cần SPOTIFY_CLIENT_ID + SPOTIFY_CLIENT_SECRET)
 
-LƯU Ý: Discord voice cần UDP outbound. Nếu host chặn UDP thì handshake xong
-nhưng bước IP discovery sẽ timeout -> code bắt lỗi và báo thay vì crash.
+FIX UDP (host chặn cổng ngẫu nhiên như Pterodactyl):
+  Monkeypatch ép socket voice UDP bind vào đúng cổng được cấp (allocation).
+  Đặt biến môi trường VOICE_UDP_PORT (mặc định 26236). CHỈ 1 voice cùng lúc.
 """
 
 import os
@@ -27,12 +28,46 @@ import re
 import random
 import asyncio
 import logging
+import socket as _socket
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 log = logging.getLogger("bot.music")
+
+# ============================================================
+# 🔧 FIX UDP: ép socket voice bind vào cổng được cấp
+# discord.py mở socket UDP ở cổng NGẪU NHIÊN -> host chặn -> timeout.
+# Ta patch VoiceConnectionState._create_socket để bind cố định.
+# Đổi cổng bằng biến môi trường VOICE_UDP_PORT (mặc định 26236).
+# GIỚI HẠN: chỉ 1 kết nối voice tại một thời điểm (1 cổng).
+# ============================================================
+try:
+    import discord.voice_state as _voice_state
+
+    VOICE_UDP_PORT = int(os.getenv("VOICE_UDP_PORT", "26236"))
+
+    def _patched_create_socket(self):
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        try:
+            s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEPORT, 1)
+        except (AttributeError, OSError):
+            pass
+        try:
+            s.bind(("0.0.0.0", VOICE_UDP_PORT))
+            log.info("🔌 Voice UDP bind vào cổng cố định %s", VOICE_UDP_PORT)
+        except OSError as e:
+            log.warning("Không bind được UDP %s (%s) -> dùng cổng ngẫu nhiên", VOICE_UDP_PORT, e)
+        s.setblocking(False)
+        self.socket = s
+        self._socket_reader.resume()
+
+    _voice_state.VoiceConnectionState._create_socket = _patched_create_socket
+    log.info("✅ Đã patch _create_socket (bind UDP cố định %s)", VOICE_UDP_PORT)
+except Exception:
+    log.exception("Không patch được voice UDP bind (bỏ qua, dùng mặc định)")
 
 # Tùy chỉnh thời gian chờ kết nối voice (giây)
 VOICE_TIMEOUT = 20.0
@@ -304,7 +339,6 @@ class Music(commands.Cog):
             return vc
         except (asyncio.TimeoutError, TimeoutError):
             log.warning("Voice connect TIMEOUT (host chặn UDP?) guild=%s channel=%s", guild.id, getattr(channel, "id", "?"))
-            # dọn dẹp voice_client treo nếu có
             try:
                 if guild.voice_client:
                     await guild.voice_client.disconnect(force=True)
