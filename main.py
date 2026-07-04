@@ -23,6 +23,8 @@ REQUIRED_PACKAGES = [
     ("discord", "discord.py>=2.3.0"),
     ("aiosqlite", "aiosqlite>=0.19.0"),
     ("aiohttp", "aiohttp>=3.8.0"),
+    ("yt_dlp", "yt-dlp>=2024.1.0"),
+    ("nacl", "PyNaCl>=1.5.0"),
 ]
 
 
@@ -85,6 +87,7 @@ COGS = [
     "cogs.auto_respond",
     "cogs.embed_creator",
     "cogs.pick_role",
+    "cogs.music",
 ]
 
 
@@ -98,6 +101,7 @@ class SecurityBot(commands.Bot):
         intents.message_content = True  # đọc nội dung tin nhắn (anti-spam/content)
         intents.guilds = True
         intents.moderation = True
+        intents.voice_states = True     # theo dõi voice cho tính năng 24/7
 
         super().__init__(
             command_prefix=commands.when_mentioned,  # chỉ dùng slash, prefix là mention
