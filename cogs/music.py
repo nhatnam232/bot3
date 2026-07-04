@@ -1,26 +1,24 @@
 """
-cogs/music.py — 24/7 Voice + Phát nhạc đa nền tảng + Panel điều khiển.
+cogs/music.py — Nhạc qua LAVALINK (wavelink) + treo 24/7 + Panel điều khiển.
 
-Slash:
-  /join, /leave, /247 <on|off> [channel] — treo voice 24/7 (có thể chọn kênh, không cần vào voice)
-  /play <query> [channel] — phát nhạc thông minh (có thể chọn kênh)
-  /randomsong [channel] — phát 1 bài ngẫu nhiên
-  /panel — hiện bảng điều khiển nhạc
-  /skip, /stop, /nowplaying
-Prefix ('!'):
-  !splay <query> — phát nhạc ngay
-  !srandomsong — phát 1 bài ngẫu nhiên
+VÌ SAO DÙNG LAVALINK:
+  Host chặn UDP outbound -> bot KHÔNG tự vào voice được (Discord voice cần UDP).
+  Lavalink chạy ở nơi có UDP; bot chỉ nói TCP/WebSocket tới Lavalink -> né chặn.
+  Luồng:  Bot --TCP/WS--> Lavalink --UDP--> Discord voice
 
-Ghi chú /play:
-  * Dán link YouTube / SoundCloud / Spotify -> tự nhận nền tảng
-  * Ghim nền tảng bằng đuôi: 'tên bài -spotify' / '-yt' / '-sc'
-  * Không ghi gì -> tự mò trên YouTube, chọn bản NHIỀU VIEW NHẤT (fallback SoundCloud)
-  * Spotify không stream trực tiếp (DRM) -> lấy metadata rồi tìm trên YouTube
-    (cần SPOTIFY_CLIENT_ID + SPOTIFY_CLIENT_SECRET)
+CẤU HÌNH (biến môi trường, có mặc định = node công cộng miễn phí):
+  LAVALINK_URI       (mặc định https://lavalinkv4.serenetia.com:443)
+  LAVALINK_PASSWORD  (mặc định https://dsc.gg/ajidevserver)
 
-FIX UDP (host chặn cổng ngẫu nhiên như Pterodactyl):
-  Monkeypatch ép socket voice UDP bind vào đúng cổng được cấp (allocation).
-  Đặt biến môi trường VOICE_UDP_PORT (mặc định 26236). CHỈ 1 voice cùng lúc.
+LỆNH:
+  Slash: /join /leave /247 <on|off> [channel] /play <query> [channel]
+         /randomsong [channel] /panel /skip /stop /nowplaying
+  Prefix ('!'): !splay <query>   !srandomsong
+
+GHI CHÚ /play:
+  * Dán link YouTube/SoundCloud/Spotify -> Lavalink tự xử lý.
+  * Ghim nền tảng bằng đuôi: 'tên bài -yt' / '-sc' / '-spotify'.
+  * Chỉ ghi tên -> mặc định tìm trên YouTube.
 """
 
 import os
@@ -28,113 +26,28 @@ import re
 import random
 import asyncio
 import logging
-import socket as _socket
 
 import discord
 from discord import app_commands
 from discord.ext import commands
+import wavelink
 
 log = logging.getLogger("bot.music")
 
 # ============================================================
-# 🔧 FIX UDP: ép socket voice bind vào cổng được cấp
-# discord.py mở socket UDP ở cổng NGẪU NHIÊN -> host chặn -> timeout.
-# Ta patch VoiceConnectionState._create_socket để bind cố định.
-# Đổi cổng bằng biến môi trường VOICE_UDP_PORT (mặc định 26236).
-# GIỚI HẠN: chỉ 1 kết nối voice tại một thời điểm (1 cổng).
+# ⚙️ CẤU HÌNH LAVALINK NODE
 # ============================================================
-try:
-    import discord.voice_state as _voice_state
+LAVALINK_URI = os.getenv("LAVALINK_URI", "https://lavalinkv4.serenetia.com:443")
+LAVALINK_PASSWORD = os.getenv("LAVALINK_PASSWORD", "https://dsc.gg/ajidevserver")
 
-    VOICE_UDP_PORT = int(os.getenv("VOICE_UDP_PORT", "26236"))
-
-    def _patched_create_socket(self):
-        s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
-        s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-        try:
-            s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEPORT, 1)
-        except (AttributeError, OSError):
-            pass
-        try:
-            s.bind(("0.0.0.0", VOICE_UDP_PORT))
-            log.info("🔌 Voice UDP bind vào cổng cố định %s", VOICE_UDP_PORT)
-        except OSError as e:
-            log.warning("Không bind được UDP %s (%s) -> dùng cổng ngẫu nhiên", VOICE_UDP_PORT, e)
-        s.setblocking(False)
-        self.socket = s
-        self._socket_reader.resume()
-
-    _voice_state.VoiceConnectionState._create_socket = _patched_create_socket
-    log.info("✅ Đã patch _create_socket (bind UDP cố định %s)", VOICE_UDP_PORT)
-except Exception:
-    log.exception("Không patch được voice UDP bind (bỏ qua, dùng mặc định)")
-
-# Tùy chỉnh thời gian chờ kết nối voice (giây)
-VOICE_TIMEOUT = 20.0
-VOICE_ERR = (
-    "❌ Không kết nối được voice (handshake xong nhưng hết giờ ở bước UDP). "
-    "Rất có thể host đang **chặn UDP outbound** — mà Discord voice bắt buộc cần UDP. "
-    "Cần mở UDP outbound trên host hoặc dùng Lavalink ở nơi có UDP."
+# Thông báo dùng chung
+NODE_ERR = (
+    "❌ Chưa kết nối được máy chủ nhạc (Lavalink). Đợi vài giây rồi thử lại. "
+    "Nếu mãi không được, node công cộng có thể đang sập — đổi node bằng biến "
+    "môi trường LAVALINK_URI / LAVALINK_PASSWORD."
 )
-
-# yt-dlp: import mềm
-try:
-    import yt_dlp
-    YTDLP_OK = True
-except ImportError:
-    YTDLP_OK = False
-
-# ffmpeg từ imageio-ffmpeg (cài qua pip/uv), fallback 'ffmpeg' trong PATH
-try:
-    import imageio_ffmpeg
-    FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
-    log.info("Dùng ffmpeg từ imageio-ffmpeg: %s", FFMPEG_EXE)
-except Exception:
-    FFMPEG_EXE = "ffmpeg"
-    log.warning("Không tìm thấy imageio-ffmpeg, dùng 'ffmpeg' trong PATH")
-
-# Spotify (tuỳ chọn) — CHỈ lấy metadata
-SPOTIFY_OK = False
-sp = None
-try:
-    import spotipy
-    from spotipy.oauth2 import SpotifyClientCredentials
-    _cid = os.getenv("SPOTIFY_CLIENT_ID")
-    _csecret = os.getenv("SPOTIFY_CLIENT_SECRET")
-    if _cid and _csecret:
-        sp = spotipy.Spotify(
-            auth_manager=SpotifyClientCredentials(client_id=_cid, client_secret=_csecret))
-        SPOTIFY_OK = True
-        log.info("Spotify metadata đã sẵn sàng")
-except Exception:
-    SPOTIFY_OK = False
-
-# ============================================================
-# ⚙️ CẤU HÌNH yt-dlp + FFmpeg
-# ============================================================
-YTDL_OPTS = {
-    "format": "bestaudio/best",
-    "noplaylist": True,
-    "quiet": True,
-    "no_warnings": True,
-    "source_address": "0.0.0.0",
-    "extract_flat": False,
-}
-YTDL_FLAT_OPTS = {
-    "quiet": True,
-    "no_warnings": True,
-    "extract_flat": "in_playlist",
-    "noplaylist": True,
-    "source_address": "0.0.0.0",
-}
-
-ytdl = yt_dlp.YoutubeDL(YTDL_OPTS) if YTDLP_OK else None
-ytdl_flat = yt_dlp.YoutubeDL(YTDL_FLAT_OPTS) if YTDLP_OK else None
-
-FFMPEG_OPTS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn",
-}
+VOICE_ERR = "❌ Không vào được voice channel. Kiểm tra quyền của bot ở kênh đó."
+NOTFOUND = "❌ Không tìm thấy bài nhạc nào."
 
 # Seed cho nhạc ngẫu nhiên
 RANDOM_SEEDS = [
@@ -143,7 +56,7 @@ RANDOM_SEEDS = [
     "kpop hits", "us uk trending", "nhac tre remix", "deep house",
 ]
 
-# Nhận diện nền tảng
+# Nhận diện nền tảng qua đuôi -yt / -sc / -spotify
 PLATFORM_TAGS = {
     "spotify": "spotify",
     "youtube": "youtube", "yt": "youtube",
@@ -162,68 +75,14 @@ def detect_platform(query: str):
         return q, "youtube", True
     if "soundcloud.com" in low:
         return q, "soundcloud", True
+    if low.startswith("http://") or low.startswith("https://"):
+        return q, None, True
     m = _TAG_RE.search(q)
     if m:
         platform = PLATFORM_TAGS[m.group(1).lower()]
         clean = _TAG_RE.sub("", q).strip()
         return clean, platform, False
     return q, None, False
-
-
-class Track:
-    def __init__(self, url, title, duration, requester=None, webpage=None, views=None):
-        self.url = url
-        self.title = title
-        self.duration = duration
-        self.requester = requester
-        self.webpage = webpage
-        self.views = views
-
-
-class MusicPlayer:
-    """Quản lý hàng đợi + phát nhạc cho 1 guild."""
-    def __init__(self, cog, guild: discord.Guild):
-        self.cog = cog
-        self.guild = guild
-        self.queue: asyncio.Queue = asyncio.Queue()
-        self.next = asyncio.Event()
-        self.current = None
-        self.volume = 0.5
-        self.task = cog.bot.loop.create_task(self._player_loop())
-
-    async def _player_loop(self):
-        await self.cog.bot.wait_until_ready()
-        while True:
-            self.next.clear()
-            try:
-                async with asyncio.timeout(300):
-                    track = await self.queue.get()
-            except (asyncio.TimeoutError, TimeoutError):
-                if not await self.cog._is_247(self.guild.id):
-                    return await self._cleanup()
-                continue
-
-            self.current = track
-            vc = self.guild.voice_client
-            if vc is None:
-                continue
-
-            source = discord.PCMVolumeTransformer(
-                discord.FFmpegPCMAudio(track.url, executable=FFMPEG_EXE, **FFMPEG_OPTS),
-                volume=self.volume,
-            )
-            vc.play(source, after=lambda e: self.cog.bot.loop.call_soon_threadsafe(self.next.set))
-            log.info("Đang phát: %s (guild %s)", track.title, self.guild.id)
-            await self.next.wait()
-            self.current = None
-
-    async def _cleanup(self):
-        vc = self.guild.voice_client
-        if vc:
-            await vc.disconnect(force=True)
-        self.cog.players.pop(self.guild.id, None)
-        if self.task:
-            self.task.cancel()
 
 
 # ============================================================
@@ -236,34 +95,31 @@ class MusicControls(discord.ui.View):
 
     @discord.ui.button(emoji="⏯️", label="Phát/Dừng", style=discord.ButtonStyle.secondary, custom_id="music:pause")
     async def pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
-        vc = interaction.guild.voice_client
-        if vc and vc.is_playing():
-            vc.pause()
-            await interaction.response.send_message("⏸️ Tạm dừng.", ephemeral=True)
-        elif vc and vc.is_paused():
-            vc.resume()
-            await interaction.response.send_message("▶️ Tiếp tục.", ephemeral=True)
+        player: wavelink.Player = interaction.guild.voice_client
+        if player and (player.playing or player.paused):
+            await player.pause(not player.paused)
+            state = "⏸️ Tạm dừng." if player.paused else "▶️ Tiếp tục."
+            await interaction.response.send_message(state, ephemeral=True)
         else:
             await interaction.response.send_message("❌ Không có nhạc đang phát.", ephemeral=True)
 
     @discord.ui.button(emoji="⏭️", label="Skip", style=discord.ButtonStyle.primary, custom_id="music:skip")
     async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
-        vc = interaction.guild.voice_client
-        if vc and vc.is_playing():
-            vc.stop()
+        player: wavelink.Player = interaction.guild.voice_client
+        if player and player.playing:
+            await player.skip(force=True)
             await interaction.response.send_message("⏭️ Đã skip.", ephemeral=True)
         else:
             await interaction.response.send_message("❌ Không có bài nào đang phát.", ephemeral=True)
 
     @discord.ui.button(emoji="⏹️", label="Stop", style=discord.ButtonStyle.danger, custom_id="music:stop")
     async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
-        player = self.cog.players.get(interaction.guild.id)
-        vc = interaction.guild.voice_client
+        player: wavelink.Player = interaction.guild.voice_client
         if player:
-            while not player.queue.empty():
-                player.queue.get_nowait()
-        if vc and (vc.is_playing() or vc.is_paused()):
-            vc.stop()
+            player.queue.clear()
+            player.autoplay = wavelink.AutoPlayMode.disabled
+            if player.playing:
+                await player.skip(force=True)
         await interaction.response.send_message("⏹️ Đã dừng & xóa hàng đợi.", ephemeral=True)
 
     @discord.ui.button(emoji="🔀", label="Random", style=discord.ButtonStyle.success, custom_id="music:random")
@@ -273,15 +129,9 @@ class MusicControls(discord.ui.View):
             return await interaction.response.send_message(
                 "❌ Vào voice hoặc bật 24/7 trước.", ephemeral=True)
         await interaction.response.defer(ephemeral=True)
-        track = await self.cog._random_track()
-        if not track:
-            return await interaction.followup.send("❌ Không lấy được bài ngẫu nhiên.", ephemeral=True)
-        vc = await self.cog._connect_to(interaction.guild, target)
-        if not vc:
-            return await interaction.followup.send(VOICE_ERR, ephemeral=True)
-        track.requester = interaction.user
-        player = self.cog._get_player(interaction.guild)
-        await player.queue.put(track)
+        track, err = await self.cog._play_random(interaction.guild, target)
+        if err:
+            return await interaction.followup.send(self.cog._msg(err), ephemeral=True)
         await interaction.followup.send(f"🔀 Đã thêm ngẫu nhiên: **{track.title}**", ephemeral=True)
 
     @discord.ui.button(emoji="🔁", label="24/7", style=discord.ButtonStyle.secondary, custom_id="music:247")
@@ -293,63 +143,40 @@ class MusicControls(discord.ui.View):
         else:
             target = await self.cog._target_channel(interaction.guild, interaction.user)
             if not target:
-                return await interaction.response.send_message(
-                    "❌ Vào voice trước.", ephemeral=True)
+                return await interaction.response.send_message("❌ Vào voice trước.", ephemeral=True)
             await interaction.response.defer(ephemeral=True)
-            vc = await self.cog._connect_to(interaction.guild, target)
-            if not vc:
-                return await interaction.followup.send(VOICE_ERR, ephemeral=True)
+            player = await self.cog._connect(interaction.guild, target)
+            if not player:
+                return await interaction.followup.send(self.cog._msg("voice"), ephemeral=True)
             await self.cog.db.set_config(gid, "music_247", 1)
             await self.cog.db.set_config(gid, "music_247_channel", target.id)
-            self.cog._get_player(interaction.guild)
-            await interaction.followup.send(
-                f"🔒 Đã BẬT 24/7 tại **{target.name}**.", ephemeral=True)
+            await interaction.followup.send(f"🔒 Đã BẬT 24/7 tại **{target.name}**.", ephemeral=True)
 
 
 class Music(commands.Cog):
-    """Cog nhạc đa nền tảng + treo voice 24/7 + panel."""
+    """Cog nhạc qua Lavalink + treo voice 24/7 + panel."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.db = bot.db
-        self.players: dict = {}
 
-    # ---- Helpers cơ bản ----
+    # ---- Helpers ----
+    def _node_ok(self) -> bool:
+        try:
+            return bool(wavelink.Pool.nodes)
+        except Exception:
+            return False
+
+    def _msg(self, err: str) -> str:
+        return {"node": NODE_ERR, "voice": VOICE_ERR, "notfound": NOTFOUND}.get(err, NOTFOUND)
+
     async def _is_247(self, guild_id: int) -> bool:
         try:
             return bool(await self.db.get_config(guild_id, "music_247"))
         except Exception:
             return False
 
-    def _get_player(self, guild: discord.Guild) -> "MusicPlayer":
-        player = self.players.get(guild.id)
-        if player is None:
-            player = MusicPlayer(self, guild)
-            self.players[guild.id] = player
-        return player
-
-    async def _connect_to(self, guild: discord.Guild, channel):
-        """Kết nối (hoặc di chuyển) bot tới voice channel. Trả None nếu lỗi/timeout."""
-        vc = guild.voice_client
-        try:
-            if vc is None:
-                return await channel.connect(self_deaf=True, timeout=VOICE_TIMEOUT, reconnect=False)
-            if vc.channel != channel:
-                await vc.move_to(channel)
-            return vc
-        except (asyncio.TimeoutError, TimeoutError):
-            log.warning("Voice connect TIMEOUT (host chặn UDP?) guild=%s channel=%s", guild.id, getattr(channel, "id", "?"))
-            try:
-                if guild.voice_client:
-                    await guild.voice_client.disconnect(force=True)
-            except Exception:
-                pass
-            return None
-        except Exception:
-            log.exception("Lỗi kết nối voice guild=%s", guild.id)
-            return None
-
-    async def _target_channel(self, guild: discord.Guild, user, explicit=None):
+    async def _target_channel(self, guild, user, explicit=None):
         """Chọn voice channel đích: explicit > user đang ở > kênh 24/7 đã lưu > bot đang ở."""
         if explicit:
             return explicit
@@ -367,134 +194,106 @@ class Music(commands.Cog):
             return guild.voice_client.channel
         return None
 
-    def _track_embed(self, track, title="🎵 Đã thêm vào hàng đợi"):
-        mins, secs = divmod(track.duration or 0, 60)
-        embed = discord.Embed(title=title, description=f"**{track.title}**", color=0x9b59b6)
-        embed.add_field(name="Thời lượng", value=f"{mins}:{secs:02d}")
-        if track.views:
-            embed.add_field(name="Lượt xem", value=f"{track.views:,}")
-        if track.webpage:
-            embed.add_field(name="Nguồn", value=f"[Mở link]({track.webpage})", inline=False)
+    async def _connect(self, guild, channel):
+        """Kết nối/di chuyển Lavalink player tới voice channel. None nếu lỗi."""
+        player: wavelink.Player = guild.voice_client
+        try:
+            if player is None:
+                player = await channel.connect(cls=wavelink.Player)
+            elif player.channel and player.channel.id != channel.id:
+                await player.move_to(channel)
+            player.autoplay = wavelink.AutoPlayMode.enabled
+            return player
+        except Exception:
+            log.exception("Lỗi kết nối Lavalink player guild=%s", guild.id)
+            return None
+
+    async def _search(self, query: str):
+        """Tìm nhạc qua Lavalink. Trả về list Playable / Playlist / None."""
+        clean, platform, is_url = detect_platform(query)
+        try:
+            if is_url:
+                return await wavelink.Playable.search(clean)
+            if platform == "soundcloud":
+                return await wavelink.Playable.search(clean, source="scsearch")
+            if platform == "spotify":
+                res = await wavelink.Playable.search(clean, source="spsearch")
+                if res:
+                    return res
+                return await wavelink.Playable.search(clean, source="ytsearch")
+            return await wavelink.Playable.search(clean, source="ytsearch")
+        except Exception:
+            log.exception("Lỗi search Lavalink")
+            return None
+
+    def _embed(self, track, title="🎵 Đã thêm vào hàng đợi"):
+        desc = f"**{track.title}**"
+        if getattr(track, "author", None):
+            desc += f"\n`{track.author}`"
+        embed = discord.Embed(title=title, description=desc, color=0x9b59b6)
+        length = getattr(track, "length", 0) or 0
+        if length:
+            mins, secs = divmod(length // 1000, 60)
+            embed.add_field(name="Thời lượng", value=f"{mins}:{secs:02d}")
+        if getattr(track, "artwork", None):
+            embed.set_thumbnail(url=track.artwork)
+        if getattr(track, "uri", None):
+            embed.add_field(name="Nguồn", value=f"[Mở link]({track.uri})", inline=False)
         return embed
 
-    # ---- Resolver nhạc ----
-    async def _extract(self, target):
-        def _do():
-            try:
-                data = ytdl.extract_info(target, download=False)
-            except Exception:
-                return None
-            if not data:
-                return None
-            if "entries" in data:
-                entries = [e for e in data["entries"] if e]
-                if not entries:
-                    return None
-                data = entries[0]
-            return data
-        data = await self.bot.loop.run_in_executor(None, _do)
-        if not data:
-            return None
-        return Track(data.get("url"), data.get("title", "Unknown"),
-                     data.get("duration", 0), None,
-                     data.get("webpage_url"), data.get("view_count"))
-
-    def _watch_url(self, entry):
-        vid = entry.get("id") or entry.get("url")
-        if vid and "http" not in str(vid):
-            return "https://www.youtube.com/watch?v=" + str(vid)
-        return vid
-
-    async def _yt_best(self, q):
-        """Search YouTube top 10 -> chọn bản NHIỀU VIEW NHẤT."""
-        def _rank():
-            try:
-                info = ytdl_flat.extract_info(f"ytsearch10:{q}", download=False)
-            except Exception:
-                return None
-            entries = [e for e in (info.get("entries") or []) if e]
-            if not entries:
-                return None
-            entries.sort(key=lambda e: e.get("view_count") or 0, reverse=True)
-            return entries[0]
-        top = await self.bot.loop.run_in_executor(None, _rank)
-        if not top:
-            return None
-        return await self._extract(self._watch_url(top))
-
-    async def _random_track(self):
-        """Chọn 1 seed ngẫu nhiên -> lấy 1 bài ngẫu nhiên trong top kết quả."""
-        seed = random.choice(RANDOM_SEEDS)
-        def _rank():
-            try:
-                info = ytdl_flat.extract_info(f"ytsearch15:{seed}", download=False)
-            except Exception:
-                return None
-            entries = [e for e in (info.get("entries") or []) if e]
-            if not entries:
-                return None
-            return random.choice(entries)
-        top = await self.bot.loop.run_in_executor(None, _rank)
-        if not top:
-            return None
-        return await self._extract(self._watch_url(top))
-
-    async def _spotify_query(self, q, is_url):
-        if not SPOTIFY_OK:
-            return None
-        def _do():
-            try:
-                if is_url:
-                    tr = sp.track(q)
-                else:
-                    res = sp.search(q=q, type="track", limit=1)
-                    items = res.get("tracks", {}).get("items", [])
-                    if not items:
-                        return None
-                    tr = items[0]
-                artists = ", ".join(a["name"] for a in tr["artists"])
-                return f"{artists} - {tr['name']}"
-            except Exception:
-                return None
-        return await self.bot.loop.run_in_executor(None, _do)
-
-    async def _resolve(self, query):
-        """Trả về (Track|None, err|None)."""
-        clean, platform, is_url = detect_platform(query)
-        if platform == "spotify":
-            if not SPOTIFY_OK:
-                return None, "spotify"
-            name = await self._spotify_query(clean, is_url)
-            if not name:
-                return None, None
-            return await self._yt_best(name), None
-        if platform == "youtube":
-            if is_url:
-                return await self._extract(clean), None
-            return await self._yt_best(clean), None
-        if platform == "soundcloud":
-            if is_url:
-                return await self._extract(clean), None
-            return await self._extract(f"scsearch1:{clean}"), None
-        track = await self._yt_best(clean)
-        if track is None:
-            track = await self._extract(f"scsearch1:{clean}")
-        return track, None
-
-    async def _play_core(self, guild, channel, requester, query):
-        """Resolve + connect + enqueue. Trả về (Track|None, err|None)."""
-        track, err = await self._resolve(query)
-        if err:
-            return None, err
-        if not track:
-            return None, "notfound"
-        vc = await self._connect_to(guild, channel)
-        if not vc:
+    async def _play_core(self, guild, channel, query):
+        """Kết nối + tìm + phát/xếp hàng. Trả về (track|None, err|None)."""
+        if not self._node_ok():
+            return None, "node"
+        player = await self._connect(guild, channel)
+        if not player:
             return None, "voice"
-        track.requester = requester
-        player = self._get_player(guild)
-        await player.queue.put(track)
+        results = await self._search(query)
+        if not results:
+            return None, "notfound"
+        if isinstance(results, wavelink.Playlist):
+            await player.queue.put_wait(results)
+            track = results.tracks[0] if results.tracks else None
+        else:
+            track = results[0]
+            await player.queue.put_wait(track)
+        if not player.playing:
+            await player.play(player.queue.get(), volume=40)
         return track, None
+
+    async def _play_random(self, guild, channel):
+        """Phát 1 bài ngẫu nhiên. Trả về (track|None, err|None)."""
+        if not self._node_ok():
+            return None, "node"
+        player = await self._connect(guild, channel)
+        if not player:
+            return None, "voice"
+        seed = random.choice(RANDOM_SEEDS)
+        results = await self._search(seed)
+        if not results:
+            return None, "notfound"
+        pool = list(results.tracks) if isinstance(results, wavelink.Playlist) else list(results)
+        pool = pool[:15]
+        if not pool:
+            return None, "notfound"
+        track = random.choice(pool)
+        await player.queue.put_wait(track)
+        if not player.playing:
+            await player.play(player.queue.get(), volume=40)
+        return track, None
+
+    # ========================================================
+    # 📡 SỰ KIỆN WAVELINK
+    # ========================================================
+    @commands.Cog.listener()
+    async def on_wavelink_node_ready(self, payload: wavelink.NodeReadyEventPayload):
+        log.info("✅ Lavalink Node đã kết nối: %s (resumed=%s)", payload.node.uri, payload.resumed)
+
+    @commands.Cog.listener()
+    async def on_wavelink_track_start(self, payload: wavelink.TrackStartEventPayload):
+        track = payload.track
+        if track:
+            log.info("Đang phát: %s", track.title)
 
     # ========================================================
     # 🔊 24/7 VOICE
@@ -506,20 +305,19 @@ class Music(commands.Cog):
             return await interaction.response.send_message(
                 "❌ Bạn phải vào một voice channel trước.", ephemeral=True)
         await interaction.response.defer(ephemeral=True)
-        vc = await self._connect_to(interaction.guild, target)
-        if not vc:
+        if not self._node_ok():
+            return await interaction.followup.send(NODE_ERR, ephemeral=True)
+        player = await self._connect(interaction.guild, target)
+        if not player:
             return await interaction.followup.send(VOICE_ERR, ephemeral=True)
         await interaction.followup.send(f"✅ Đã vào **{target.name}**.", ephemeral=True)
 
     @app_commands.command(name="leave", description="Bot rời voice channel")
     async def leave(self, interaction: discord.Interaction):
-        vc = interaction.guild.voice_client
-        if vc:
+        player: wavelink.Player = interaction.guild.voice_client
+        if player:
             await self.db.set_config(interaction.guild.id, "music_247", 0)
-            player = self.players.pop(interaction.guild.id, None)
-            if player and player.task:
-                player.task.cancel()
-            await vc.disconnect(force=True)
+            await player.disconnect()
             await interaction.response.send_message("👋 Đã rời voice.", ephemeral=True)
         else:
             await interaction.response.send_message("❌ Bot không ở trong voice.", ephemeral=True)
@@ -540,12 +338,13 @@ class Music(commands.Cog):
                 return await interaction.response.send_message(
                     "❌ Chọn 1 voice channel hoặc vào voice trước.", ephemeral=True)
             await interaction.response.defer(ephemeral=True)
-            vc = await self._connect_to(interaction.guild, target)
-            if not vc:
+            if not self._node_ok():
+                return await interaction.followup.send(NODE_ERR, ephemeral=True)
+            player = await self._connect(interaction.guild, target)
+            if not player:
                 return await interaction.followup.send(VOICE_ERR, ephemeral=True)
             await self.db.set_config(interaction.guild.id, "music_247", 1)
             await self.db.set_config(interaction.guild.id, "music_247_channel", target.id)
-            self._get_player(interaction.guild)
             await interaction.followup.send(
                 f"🔒 Đã BẬT 24/7 tại **{target.name}**. Bot sẽ tự vào lại nếu bị ngắt.",
                 ephemeral=True)
@@ -565,68 +364,51 @@ class Music(commands.Cog):
                 channel = guild.get_channel(channel_id) if channel_id else before.channel
                 if channel:
                     await asyncio.sleep(3)
-                    vc = await self._connect_to(guild, channel)
-                    if vc:
+                    player = await self._connect(guild, channel)
+                    if player:
                         log.info("🔁 Tự vào lại voice 24/7: %s", guild.name)
                     else:
-                        log.warning("Không thể vào lại voice 24/7 (UDP?): %s", guild.name)
+                        log.warning("Không vào lại được voice 24/7: %s", guild.name)
 
     # ========================================================
     # 🎵 PHÁT NHẠC (slash)
     # ========================================================
     @app_commands.command(
         name="play",
-        description="Phát nhạc (YouTube/SoundCloud/Spotify — tự mò nếu chỉ ghi tên)")
+        description="Phát nhạc (YouTube/SoundCloud/Spotify — tự tìm nếu chỉ ghi tên)")
     @app_commands.describe(
         query="Tên bài hoặc link. Ghim nền tảng: 'tên bài -spotify' / '-yt' / '-sc'",
         channel="Voice channel muốn phát (tùy chọn, không cần bạn vào voice)")
     async def play(self, interaction: discord.Interaction, query: str,
                    channel: discord.VoiceChannel = None):
-        if not YTDLP_OK:
-            return await interaction.response.send_message(
-                "❌ Thiếu thư viện `yt-dlp`. Kiểm tra requirements.txt.", ephemeral=True)
         target = await self._target_channel(interaction.guild, interaction.user, channel)
         if not target:
             return await interaction.response.send_message(
                 "❌ Chọn 1 voice channel hoặc vào voice trước.", ephemeral=True)
         await interaction.response.defer()
-        track, err = await self._play_core(interaction.guild, target, interaction.user, query)
-        if err == "spotify":
-            return await interaction.followup.send(
-                "❌ Spotify chưa được cấu hình. Cần đặt `SPOTIFY_CLIENT_ID` và "
-                "`SPOTIFY_CLIENT_SECRET`. Tạm dùng YouTube/SoundCloud hoặc dán link nhé.")
-        if err == "voice":
-            return await interaction.followup.send(VOICE_ERR)
-        if err or not track:
-            return await interaction.followup.send("❌ Không tìm thấy bài nhạc.")
-        await interaction.followup.send(embed=self._track_embed(track), view=MusicControls(self))
+        track, err = await self._play_core(interaction.guild, target, query)
+        if err:
+            return await interaction.followup.send(self._msg(err))
+        await interaction.followup.send(embed=self._embed(track), view=MusicControls(self))
 
     @app_commands.command(name="randomsong", description="Phát 1 bài nhạc ngẫu nhiên")
     @app_commands.describe(channel="Voice channel muốn phát (tùy chọn)")
     async def randomsong(self, interaction: discord.Interaction,
                          channel: discord.VoiceChannel = None):
-        if not YTDLP_OK:
-            return await interaction.response.send_message("❌ Thiếu yt-dlp.", ephemeral=True)
         target = await self._target_channel(interaction.guild, interaction.user, channel)
         if not target:
             return await interaction.response.send_message(
                 "❌ Chọn 1 voice channel hoặc vào voice trước.", ephemeral=True)
         await interaction.response.defer()
-        track = await self._random_track()
-        if not track:
-            return await interaction.followup.send("❌ Không lấy được bài ngẫu nhiên.")
-        vc = await self._connect_to(interaction.guild, target)
-        if not vc:
-            return await interaction.followup.send(VOICE_ERR)
-        track.requester = interaction.user
-        player = self._get_player(interaction.guild)
-        await player.queue.put(track)
+        track, err = await self._play_random(interaction.guild, target)
+        if err:
+            return await interaction.followup.send(self._msg(err))
         await interaction.followup.send(
-            embed=self._track_embed(track, "🔀 Ngẫu nhiên"), view=MusicControls(self))
+            embed=self._embed(track, "🔀 Ngẫu nhiên"), view=MusicControls(self))
 
     @app_commands.command(name="panel", description="Hiện bảng điều khiển nhạc")
     async def panel(self, interaction: discord.Interaction):
-        player = self.players.get(interaction.guild.id)
+        player: wavelink.Player = interaction.guild.voice_client
         desc = "Không có bài nào đang phát."
         if player and player.current:
             desc = f"🎧 Đang phát: **{player.current.title}**"
@@ -635,30 +417,29 @@ class Music(commands.Cog):
 
     @app_commands.command(name="skip", description="Bỏ qua bài đang phát")
     async def skip(self, interaction: discord.Interaction):
-        vc = interaction.guild.voice_client
-        if vc and vc.is_playing():
-            vc.stop()
+        player: wavelink.Player = interaction.guild.voice_client
+        if player and player.playing:
+            await player.skip(force=True)
             await interaction.response.send_message("⏭️ Đã skip.", ephemeral=True)
         else:
             await interaction.response.send_message("❌ Không có bài nào đang phát.", ephemeral=True)
 
     @app_commands.command(name="stop", description="Dừng nhạc & xóa hàng đợi")
     async def stop(self, interaction: discord.Interaction):
-        player = self.players.get(interaction.guild.id)
-        vc = interaction.guild.voice_client
+        player: wavelink.Player = interaction.guild.voice_client
         if player:
-            while not player.queue.empty():
-                player.queue.get_nowait()
-        if vc and (vc.is_playing() or vc.is_paused()):
-            vc.stop()
+            player.queue.clear()
+            player.autoplay = wavelink.AutoPlayMode.disabled
+            if player.playing:
+                await player.skip(force=True)
         await interaction.response.send_message("⏹️ Đã dừng & xóa hàng đợi.", ephemeral=True)
 
     @app_commands.command(name="nowplaying", description="Xem bài đang phát")
     async def nowplaying(self, interaction: discord.Interaction):
-        player = self.players.get(interaction.guild.id)
+        player: wavelink.Player = interaction.guild.voice_client
         if player and player.current:
             await interaction.response.send_message(
-                embed=self._track_embed(player.current, "🎧 Đang phát"),
+                embed=self._embed(player.current, "🎧 Đang phát"),
                 view=MusicControls(self))
         else:
             await interaction.response.send_message("📭 Không có bài nào đang phát.", ephemeral=True)
@@ -669,50 +450,44 @@ class Music(commands.Cog):
     @commands.command(name="splay")
     async def splay(self, ctx: commands.Context, *, query: str = None):
         """!splay <tên bài / link> — phát nhạc ngay."""
-        if not YTDLP_OK:
-            return await ctx.send("❌ Thiếu thư viện yt-dlp.")
         if not query:
             return await ctx.send("ℹ️ Dùng: `!splay <tên bài hoặc link>`")
         target = await self._target_channel(ctx.guild, ctx.author)
         if not target:
             return await ctx.send("❌ Vào voice hoặc bật 24/7 trước đã.")
         msg = await ctx.send(f"🔎 Đang tìm: **{query}**...")
-        track, err = await self._play_core(ctx.guild, target, ctx.author, query)
-        if err == "spotify":
-            return await msg.edit(content="❌ Spotify chưa cấu hình (thiếu CLIENT_ID/SECRET).")
-        if err == "voice":
-            return await msg.edit(content=VOICE_ERR)
-        if err or not track:
-            return await msg.edit(content="❌ Không tìm thấy bài nhạc.")
-        await msg.edit(content=None, embed=self._track_embed(track), view=MusicControls(self))
+        track, err = await self._play_core(ctx.guild, target, query)
+        if err:
+            return await msg.edit(content=self._msg(err))
+        await msg.edit(content=None, embed=self._embed(track), view=MusicControls(self))
 
     @commands.command(name="srandomsong")
     async def srandomsong(self, ctx: commands.Context):
         """!srandomsong — phát 1 bài ngẫu nhiên."""
-        if not YTDLP_OK:
-            return await ctx.send("❌ Thiếu thư viện yt-dlp.")
         target = await self._target_channel(ctx.guild, ctx.author)
         if not target:
             return await ctx.send("❌ Vào voice hoặc bật 24/7 trước đã.")
         msg = await ctx.send("🎲 Đang chọn bài ngẫu nhiên...")
-        track = await self._random_track()
-        if not track:
-            return await msg.edit(content="❌ Không lấy được bài ngẫu nhiên.")
-        vc = await self._connect_to(ctx.guild, target)
-        if not vc:
-            return await msg.edit(content=VOICE_ERR)
-        track.requester = ctx.author
-        player = self._get_player(ctx.guild)
-        await player.queue.put(track)
+        track, err = await self._play_random(ctx.guild, target)
+        if err:
+            return await msg.edit(content=self._msg(err))
         await msg.edit(content=None,
-                       embed=self._track_embed(track, "🔀 Ngẫu nhiên"),
+                       embed=self._embed(track, "🔀 Ngẫu nhiên"),
                        view=MusicControls(self))
 
 
 async def setup(bot: commands.Bot):
     cog = Music(bot)
     await bot.add_cog(cog)
+    # Đăng ký view panel bền vững (nút bấm vẫn chạy sau restart)
     try:
         bot.add_view(MusicControls(cog))
     except Exception:
         log.exception("Không đăng ký được MusicControls view")
+    # Kết nối tới Lavalink node
+    try:
+        node = wavelink.Node(uri=LAVALINK_URI, password=LAVALINK_PASSWORD)
+        await wavelink.Pool.connect(nodes=[node], client=bot, cache_capacity=100)
+        log.info("🎶 Đang kết nối Lavalink: %s", LAVALINK_URI)
+    except Exception:
+        log.exception("Không kết nối được Lavalink pool")

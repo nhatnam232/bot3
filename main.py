@@ -24,10 +24,7 @@ REQUIRED_PACKAGES = [
     ("discord", "discord.py>=2.3.0"),
     ("aiosqlite", "aiosqlite>=0.19.0"),
     ("aiohttp", "aiohttp>=3.8.0"),
-    ("yt_dlp", "yt-dlp>=2024.1.0"),
-    ("nacl", "PyNaCl>=1.5.0"),
-    ("imageio_ffmpeg", "imageio-ffmpeg>=0.5.1"),
-    ("spotipy", "spotipy>=2.23.0"),
+    ("wavelink", "wavelink>=3.5.0,<4.0.0"),
 ]
 
 
