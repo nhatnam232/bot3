@@ -27,6 +27,7 @@ REQUIRED_PACKAGES = [
     ("yt_dlp", "yt-dlp>=2024.1.0"),
     ("nacl", "PyNaCl>=1.5.0"),
     ("imageio_ffmpeg", "imageio-ffmpeg>=0.5.1"),
+    ("spotipy", "spotipy>=2.23.0"),
 ]
 
 
@@ -100,13 +101,13 @@ class SecurityBot(commands.Bot):
         # Cần đầy đủ intents để theo dõi member join, message content, audit log...
         intents = discord.Intents.default()
         intents.members = True          # on_member_join, member update
-        intents.message_content = True  # đọc nội dung tin nhắn (anti-spam/content)
+        intents.message_content = True  # đọc nội dung tin nhắn (anti-spam/content + prefix)
         intents.guilds = True
         intents.moderation = True
         intents.voice_states = True     # theo dõi voice cho tính năng 24/7
 
         super().__init__(
-            command_prefix=commands.when_mentioned,  # chỉ dùng slash, prefix là mention
+            command_prefix=commands.when_mentioned_or("!"),  # slash + prefix '!'
             intents=intents,
             help_command=None,
         )
