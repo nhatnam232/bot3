@@ -17,6 +17,9 @@ Ghi chú /play:
   * Không ghi gì -> tự mò trên YouTube, chọn bản NHIỀU VIEW NHẤT (fallback SoundCloud)
   * Spotify không stream trực tiếp (DRM) -> lấy metadata rồi tìm trên YouTube
     (cần SPOTIFY_CLIENT_ID + SPOTIFY_CLIENT_SECRET)
+
+LƯU Ý: Discord voice cần UDP outbound. Nếu host chặn UDP thì handshake xong
+nhưng bước IP discovery sẽ timeout -> code bắt lỗi và báo thay vì crash.
 """
 
 import os
@@ -30,6 +33,14 @@ from discord import app_commands
 from discord.ext import commands
 
 log = logging.getLogger("bot.music")
+
+# Tùy chỉnh thời gian chờ kết nối voice (giây)
+VOICE_TIMEOUT = 20.0
+VOICE_ERR = (
+    "❌ Không kết nối được voice (handshake xong nhưng hết giờ ở bước UDP). "
+    "Rất có thể host đang **chặn UDP outbound** — mà Discord voice bắt buộc cần UDP. "
+    "Cần mở UDP outbound trên host hoặc dùng Lavalink ở nơi có UDP."
+)
 
 # yt-dlp: import mềm
 try:
@@ -230,7 +241,9 @@ class MusicControls(discord.ui.View):
         track = await self.cog._random_track()
         if not track:
             return await interaction.followup.send("❌ Không lấy được bài ngẫu nhiên.", ephemeral=True)
-        await self.cog._connect_to(interaction.guild, target)
+        vc = await self.cog._connect_to(interaction.guild, target)
+        if not vc:
+            return await interaction.followup.send(VOICE_ERR, ephemeral=True)
         track.requester = interaction.user
         player = self.cog._get_player(interaction.guild)
         await player.queue.put(track)
@@ -246,12 +259,15 @@ class MusicControls(discord.ui.View):
             target = await self.cog._target_channel(interaction.guild, interaction.user)
             if not target:
                 return await interaction.response.send_message(
-                    "❌ Vào voice hoặc đang có bot trong voice trước.", ephemeral=True)
-            await self.cog._connect_to(interaction.guild, target)
+                    "❌ Vào voice trước.", ephemeral=True)
+            await interaction.response.defer(ephemeral=True)
+            vc = await self.cog._connect_to(interaction.guild, target)
+            if not vc:
+                return await interaction.followup.send(VOICE_ERR, ephemeral=True)
             await self.cog.db.set_config(gid, "music_247", 1)
             await self.cog.db.set_config(gid, "music_247_channel", target.id)
             self.cog._get_player(interaction.guild)
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"🔒 Đã BẬT 24/7 tại **{target.name}**.", ephemeral=True)
 
 
@@ -278,13 +294,26 @@ class Music(commands.Cog):
         return player
 
     async def _connect_to(self, guild: discord.Guild, channel):
-        """Kết nối (hoặc di chuyển) bot tới 1 voice channel."""
+        """Kết nối (hoặc di chuyển) bot tới voice channel. Trả None nếu lỗi/timeout."""
         vc = guild.voice_client
-        if vc is None:
-            return await channel.connect(self_deaf=True)
-        if vc.channel != channel:
-            await vc.move_to(channel)
-        return vc
+        try:
+            if vc is None:
+                return await channel.connect(self_deaf=True, timeout=VOICE_TIMEOUT, reconnect=False)
+            if vc.channel != channel:
+                await vc.move_to(channel)
+            return vc
+        except (asyncio.TimeoutError, TimeoutError):
+            log.warning("Voice connect TIMEOUT (host chặn UDP?) guild=%s channel=%s", guild.id, getattr(channel, "id", "?"))
+            # dọn dẹp voice_client treo nếu có
+            try:
+                if guild.voice_client:
+                    await guild.voice_client.disconnect(force=True)
+            except Exception:
+                pass
+            return None
+        except Exception:
+            log.exception("Lỗi kết nối voice guild=%s", guild.id)
+            return None
 
     async def _target_channel(self, guild: discord.Guild, user, explicit=None):
         """Chọn voice channel đích: explicit > user đang ở > kênh 24/7 đã lưu > bot đang ở."""
@@ -413,7 +442,6 @@ class Music(commands.Cog):
             if is_url:
                 return await self._extract(clean), None
             return await self._extract(f"scsearch1:{clean}"), None
-        # Không ghim -> YouTube nhiều view nhất, fallback SoundCloud
         track = await self._yt_best(clean)
         if track is None:
             track = await self._extract(f"scsearch1:{clean}")
@@ -426,7 +454,9 @@ class Music(commands.Cog):
             return None, err
         if not track:
             return None, "notfound"
-        await self._connect_to(guild, channel)
+        vc = await self._connect_to(guild, channel)
+        if not vc:
+            return None, "voice"
         track.requester = requester
         player = self._get_player(guild)
         await player.queue.put(track)
@@ -441,8 +471,11 @@ class Music(commands.Cog):
         if not target:
             return await interaction.response.send_message(
                 "❌ Bạn phải vào một voice channel trước.", ephemeral=True)
-        await self._connect_to(interaction.guild, target)
-        await interaction.response.send_message(f"✅ Đã vào **{target.name}**.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        vc = await self._connect_to(interaction.guild, target)
+        if not vc:
+            return await interaction.followup.send(VOICE_ERR, ephemeral=True)
+        await interaction.followup.send(f"✅ Đã vào **{target.name}**.", ephemeral=True)
 
     @app_commands.command(name="leave", description="Bot rời voice channel")
     async def leave(self, interaction: discord.Interaction):
@@ -472,11 +505,14 @@ class Music(commands.Cog):
             if not target:
                 return await interaction.response.send_message(
                     "❌ Chọn 1 voice channel hoặc vào voice trước.", ephemeral=True)
-            await self._connect_to(interaction.guild, target)
+            await interaction.response.defer(ephemeral=True)
+            vc = await self._connect_to(interaction.guild, target)
+            if not vc:
+                return await interaction.followup.send(VOICE_ERR, ephemeral=True)
             await self.db.set_config(interaction.guild.id, "music_247", 1)
             await self.db.set_config(interaction.guild.id, "music_247_channel", target.id)
             self._get_player(interaction.guild)
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"🔒 Đã BẬT 24/7 tại **{target.name}**. Bot sẽ tự vào lại nếu bị ngắt.",
                 ephemeral=True)
         else:
@@ -495,11 +531,11 @@ class Music(commands.Cog):
                 channel = guild.get_channel(channel_id) if channel_id else before.channel
                 if channel:
                     await asyncio.sleep(3)
-                    try:
-                        await channel.connect(self_deaf=True)
+                    vc = await self._connect_to(guild, channel)
+                    if vc:
                         log.info("🔁 Tự vào lại voice 24/7: %s", guild.name)
-                    except Exception:
-                        log.exception("Không thể vào lại voice 24/7")
+                    else:
+                        log.warning("Không thể vào lại voice 24/7 (UDP?): %s", guild.name)
 
     # ========================================================
     # 🎵 PHÁT NHẠC (slash)
@@ -525,6 +561,8 @@ class Music(commands.Cog):
             return await interaction.followup.send(
                 "❌ Spotify chưa được cấu hình. Cần đặt `SPOTIFY_CLIENT_ID` và "
                 "`SPOTIFY_CLIENT_SECRET`. Tạm dùng YouTube/SoundCloud hoặc dán link nhé.")
+        if err == "voice":
+            return await interaction.followup.send(VOICE_ERR)
         if err or not track:
             return await interaction.followup.send("❌ Không tìm thấy bài nhạc.")
         await interaction.followup.send(embed=self._track_embed(track), view=MusicControls(self))
@@ -543,7 +581,9 @@ class Music(commands.Cog):
         track = await self._random_track()
         if not track:
             return await interaction.followup.send("❌ Không lấy được bài ngẫu nhiên.")
-        await self._connect_to(interaction.guild, target)
+        vc = await self._connect_to(interaction.guild, target)
+        if not vc:
+            return await interaction.followup.send(VOICE_ERR)
         track.requester = interaction.user
         player = self._get_player(interaction.guild)
         await player.queue.put(track)
@@ -606,6 +646,8 @@ class Music(commands.Cog):
         track, err = await self._play_core(ctx.guild, target, ctx.author, query)
         if err == "spotify":
             return await msg.edit(content="❌ Spotify chưa cấu hình (thiếu CLIENT_ID/SECRET).")
+        if err == "voice":
+            return await msg.edit(content=VOICE_ERR)
         if err or not track:
             return await msg.edit(content="❌ Không tìm thấy bài nhạc.")
         await msg.edit(content=None, embed=self._track_embed(track), view=MusicControls(self))
@@ -622,7 +664,9 @@ class Music(commands.Cog):
         track = await self._random_track()
         if not track:
             return await msg.edit(content="❌ Không lấy được bài ngẫu nhiên.")
-        await self._connect_to(ctx.guild, target)
+        vc = await self._connect_to(ctx.guild, target)
+        if not vc:
+            return await msg.edit(content=VOICE_ERR)
         track.requester = ctx.author
         player = self._get_player(ctx.guild)
         await player.queue.put(track)
@@ -634,7 +678,6 @@ class Music(commands.Cog):
 async def setup(bot: commands.Bot):
     cog = Music(bot)
     await bot.add_cog(cog)
-    # Đăng ký panel bền vững (nút vẫn hoạt động sau khi bot restart)
     try:
         bot.add_view(MusicControls(cog))
     except Exception:
