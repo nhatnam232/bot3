@@ -12,7 +12,7 @@ CẤU HÌNH (biến môi trường, có mặc định = node công cộng miễn
 
 LỆNH:
   Slash: /join /leave /247 <on|off> [channel] /play <query> [channel]
-         /randomsong [channel] /randomplaylist [count] [channel]
+         /randomsong [channel] /randomplaylist <playlist> [channel]
          /queue /volume <0-150> /loop <off|track|queue>
          /panel /skip /stop /nowplaying
   Prefix ('!'): !splay <query>   !srandomsong
@@ -21,6 +21,10 @@ GHI CHÚ /play:
   * Dán link YouTube/SoundCloud/Spotify -> Lavalink tự xử lý.
   * Ghim nền tảng bằng đuôi: 'tên bài -yt' / '-sc' / '-spotify'.
   * Chỉ ghi tên -> mặc định tìm trên YouTube.
+
+GHI CHÚ /randomplaylist:
+  * Đưa LINK PLAYLIST (Spotify/YouTube/SoundCloud) hoặc tên -> bot tải cả
+    playlist, XÁO TRỘN ngẫu nhiên rồi phát.
 """
 
 import os
@@ -51,7 +55,7 @@ NODE_ERR = (
 VOICE_ERR = "❌ Không vào được voice channel. Kiểm tra quyền của bot ở kênh đó."
 NOTFOUND = "❌ Không tìm thấy bài nhạc nào."
 
-# Seed cho nhạc ngẫu nhiên
+# Seed cho nhạc ngẫu nhiên (dùng cho /randomsong)
 RANDOM_SEEDS = [
     "lofi hip hop", "vietnamese chill", "edm 2024", "pop hits 2024",
     "rap viet hay nhat", "acoustic viet", "phonk", "vinahouse",
@@ -334,7 +338,7 @@ class Music(commands.Cog):
         return track, None
 
     async def _play_random(self, guild, channel):
-        """Phát 1 bài ngẫu nhiên. Trả về (track|None, err|None)."""
+        """Phát 1 bài ngẫu nhiên (seed sẵn). Trả về (track|None, err|None)."""
         if not self._node_ok():
             return None, "node"
         player = await self._connect(guild, channel)
@@ -354,32 +358,27 @@ class Music(commands.Cog):
             await player.play(player.queue.get(), volume=40)
         return track, None
 
-    async def _play_random_many(self, guild, channel, count=10):
-        """Thêm nhiều bài ngẫu nhiên (playlist ngẫu nhiên). Trả về (added, first|None, err|None)."""
+    async def _play_playlist_shuffled(self, guild, channel, query):
+        """Tải playlist người dùng đưa (link/tên), XÁO TRỘN rồi phát.
+        Trả về (added, first|None, is_playlist, err|None)."""
         if not self._node_ok():
-            return 0, None, "node"
+            return 0, None, False, "node"
         player = await self._connect(guild, channel)
         if not player:
-            return 0, None, "voice"
-        collected = []
-        seeds = random.sample(RANDOM_SEEDS, min(len(RANDOM_SEEDS), 4))
-        for seed in seeds:
-            res = await self._search(seed)
-            if not res:
-                continue
-            pool = list(res.tracks) if isinstance(res, wavelink.Playlist) else list(res)
-            collected.extend(pool)
-            if len(collected) >= count:
-                break
-        if not collected:
-            return 0, None, "notfound"
-        random.shuffle(collected)
-        chosen = collected[:count]
-        added = await player.queue.put_wait(chosen)
-        first = chosen[0]
+            return 0, None, False, "voice"
+        results = await self._search(query)
+        if not results:
+            return 0, None, False, "notfound"
+        is_playlist = isinstance(results, wavelink.Playlist)
+        tracks = list(results.tracks) if is_playlist else list(results)
+        if not tracks:
+            return 0, None, is_playlist, "notfound"
+        random.shuffle(tracks)  # 🔀 xáo trộn ngẫu nhiên
+        added = await player.queue.put_wait(tracks)
+        first = tracks[0]
         if not player.playing:
             await player.play(player.queue.get(), volume=40)
-        return added, first, None
+        return added, first, is_playlist, None
 
     # ========================================================
     # 📡 SỰ KIỆN WAVELINK
@@ -506,23 +505,26 @@ class Music(commands.Cog):
             embed=self._embed(track, "🔀 Ngẫu nhiên"), view=MusicControls(self))
 
     @app_commands.command(name="randomplaylist",
-                          description="Thêm nhiều bài ngẫu nhiên vào hàng đợi (playlist ngẫu nhiên)")
-    @app_commands.describe(count="Số bài (mặc định 10, tối đa 25)",
+                          description="Đưa link playlist (Spotify/YouTube/SoundCloud) -> bot xáo trộn rồi phát")
+    @app_commands.describe(playlist="Link playlist Spotify/YouTube/SoundCloud (hoặc tên để tìm)",
                            channel="Voice channel muốn phát (tùy chọn)")
     async def randomplaylist(self, interaction: discord.Interaction,
-                             count: app_commands.Range[int, 1, 25] = 10,
+                             playlist: str,
                              channel: discord.VoiceChannel = None):
         target = await self._target_channel(interaction.guild, interaction.user, channel)
         if not target:
             return await interaction.response.send_message(
                 "❌ Chọn 1 voice channel hoặc vào voice trước.", ephemeral=True)
         await interaction.response.defer()
-        added, first, err = await self._play_random_many(interaction.guild, target, count)
+        added, first, is_playlist, err = await self._play_playlist_shuffled(
+            interaction.guild, target, playlist)
         if err:
             return await interaction.followup.send(self._msg(err))
+        note = "" if is_playlist else "\n_(Không phải link playlist — mình xáo trộn kết quả tìm được.)_"
         embed = discord.Embed(
-            title="🎲 Playlist ngẫu nhiên",
-            description=f"Đã thêm **{added}** bài vào hàng đợi.\nBắt đầu: **{first.title}**",
+            title="🔀 Playlist đã xáo trộn",
+            description=f"Đã thêm **{added}** bài (đã trộn ngẫu nhiên) vào hàng đợi.\n"
+                        f"Bắt đầu: **{first.title}**{note}",
             color=0x9b59b6)
         await interaction.followup.send(embed=embed, view=MusicControls(self))
 
