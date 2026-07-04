@@ -12,7 +12,9 @@ CẤU HÌNH (biến môi trường, có mặc định = node công cộng miễn
 
 LỆNH:
   Slash: /join /leave /247 <on|off> [channel] /play <query> [channel]
-         /randomsong [channel] /panel /skip /stop /nowplaying
+         /randomsong [channel] /randomplaylist [count] [channel]
+         /queue /volume <0-150> /loop <off|track|queue>
+         /panel /skip /stop /nowplaying
   Prefix ('!'): !splay <query>   !srandomsong
 
 GHI CHÚ /play:
@@ -93,7 +95,8 @@ class MusicControls(discord.ui.View):
         super().__init__(timeout=None)
         self.cog = cog
 
-    @discord.ui.button(emoji="⏯️", label="Phát/Dừng", style=discord.ButtonStyle.secondary, custom_id="music:pause")
+    # ---- Hàng 1: điều khiển phát ----
+    @discord.ui.button(emoji="⏯️", label="Phát/Dừng", style=discord.ButtonStyle.secondary, custom_id="music:pause", row=0)
     async def pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
         player: wavelink.Player = interaction.guild.voice_client
         if player and (player.playing or player.paused):
@@ -103,7 +106,7 @@ class MusicControls(discord.ui.View):
         else:
             await interaction.response.send_message("❌ Không có nhạc đang phát.", ephemeral=True)
 
-    @discord.ui.button(emoji="⏭️", label="Skip", style=discord.ButtonStyle.primary, custom_id="music:skip")
+    @discord.ui.button(emoji="⏭️", label="Skip", style=discord.ButtonStyle.primary, custom_id="music:skip", row=0)
     async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
         player: wavelink.Player = interaction.guild.voice_client
         if player and player.playing:
@@ -112,17 +115,18 @@ class MusicControls(discord.ui.View):
         else:
             await interaction.response.send_message("❌ Không có bài nào đang phát.", ephemeral=True)
 
-    @discord.ui.button(emoji="⏹️", label="Stop", style=discord.ButtonStyle.danger, custom_id="music:stop")
+    @discord.ui.button(emoji="⏹️", label="Stop", style=discord.ButtonStyle.danger, custom_id="music:stop", row=0)
     async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
         player: wavelink.Player = interaction.guild.voice_client
         if player:
             player.queue.clear()
+            player.queue.mode = wavelink.QueueMode.normal
             player.autoplay = wavelink.AutoPlayMode.disabled
             if player.playing:
                 await player.skip(force=True)
         await interaction.response.send_message("⏹️ Đã dừng & xóa hàng đợi.", ephemeral=True)
 
-    @discord.ui.button(emoji="🔀", label="Random", style=discord.ButtonStyle.success, custom_id="music:random")
+    @discord.ui.button(emoji="🔀", label="Random", style=discord.ButtonStyle.success, custom_id="music:random", row=0)
     async def random_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         target = await self.cog._target_channel(interaction.guild, interaction.user)
         if not target:
@@ -134,7 +138,7 @@ class MusicControls(discord.ui.View):
             return await interaction.followup.send(self.cog._msg(err), ephemeral=True)
         await interaction.followup.send(f"🔀 Đã thêm ngẫu nhiên: **{track.title}**", ephemeral=True)
 
-    @discord.ui.button(emoji="🔁", label="24/7", style=discord.ButtonStyle.secondary, custom_id="music:247")
+    @discord.ui.button(emoji="🔁", label="24/7", style=discord.ButtonStyle.secondary, custom_id="music:247", row=0)
     async def toggle_247(self, interaction: discord.Interaction, button: discord.ui.Button):
         gid = interaction.guild.id
         if await self.cog._is_247(gid):
@@ -151,6 +155,49 @@ class MusicControls(discord.ui.View):
             await self.cog.db.set_config(gid, "music_247", 1)
             await self.cog.db.set_config(gid, "music_247_channel", target.id)
             await interaction.followup.send(f"🔒 Đã BẬT 24/7 tại **{target.name}**.", ephemeral=True)
+
+    # ---- Hàng 2: âm lượng / loop / danh sách ----
+    @discord.ui.button(emoji="🔉", label="Vol -", style=discord.ButtonStyle.secondary, custom_id="music:voldown", row=1)
+    async def vol_down(self, interaction: discord.Interaction, button: discord.ui.Button):
+        player: wavelink.Player = interaction.guild.voice_client
+        if not player:
+            return await interaction.response.send_message("❌ Bot không ở trong voice.", ephemeral=True)
+        new = max(0, player.volume - 10)
+        await player.set_volume(new)
+        await interaction.response.send_message(f"🔉 Âm lượng: **{new}%**", ephemeral=True)
+
+    @discord.ui.button(emoji="🔊", label="Vol +", style=discord.ButtonStyle.secondary, custom_id="music:volup", row=1)
+    async def vol_up(self, interaction: discord.Interaction, button: discord.ui.Button):
+        player: wavelink.Player = interaction.guild.voice_client
+        if not player:
+            return await interaction.response.send_message("❌ Bot không ở trong voice.", ephemeral=True)
+        new = min(150, player.volume + 10)
+        await player.set_volume(new)
+        await interaction.response.send_message(f"🔊 Âm lượng: **{new}%**", ephemeral=True)
+
+    @discord.ui.button(emoji="🔂", label="Loop", style=discord.ButtonStyle.secondary, custom_id="music:loop", row=1)
+    async def loop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        player: wavelink.Player = interaction.guild.voice_client
+        if not player:
+            return await interaction.response.send_message("❌ Bot không ở trong voice.", ephemeral=True)
+        mode = player.queue.mode
+        if mode == wavelink.QueueMode.normal:
+            player.queue.mode = wavelink.QueueMode.loop
+            txt = "🔂 Lặp lại 1 bài."
+        elif mode == wavelink.QueueMode.loop:
+            player.queue.mode = wavelink.QueueMode.loop_all
+            txt = "🔁 Lặp cả hàng đợi."
+        else:
+            player.queue.mode = wavelink.QueueMode.normal
+            txt = "➡️ Đã tắt lặp."
+        await interaction.response.send_message(txt, ephemeral=True)
+
+    @discord.ui.button(emoji="📜", label="Danh sách", style=discord.ButtonStyle.primary, custom_id="music:queue", row=1)
+    async def queue_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        player: wavelink.Player = interaction.guild.voice_client
+        if not player or (not player.current and player.queue.is_empty):
+            return await interaction.response.send_message("📭 Hàng đợi trống.", ephemeral=True)
+        await interaction.response.send_message(embed=self.cog._queue_embed(player), ephemeral=True)
 
 
 class Music(commands.Cog):
@@ -241,6 +288,31 @@ class Music(commands.Cog):
             embed.add_field(name="Nguồn", value=f"[Mở link]({track.uri})", inline=False)
         return embed
 
+    def _queue_embed(self, player):
+        """Embed hiển thị hàng đợi hiện tại + trạng thái loop/âm lượng."""
+        embed = discord.Embed(title="📜 Hàng đợi nhạc", color=0x9b59b6)
+        cur = getattr(player, "current", None)
+        if cur:
+            embed.add_field(name="🎧 Đang phát", value=f"**{cur.title}**", inline=False)
+        items = list(player.queue)
+        if items:
+            lines = [f"`{i}.` {t.title}" for i, t in enumerate(items[:10], 1)]
+            more = len(items) - 10
+            if more > 0:
+                lines.append(f"... và {more} bài nữa")
+            embed.add_field(name=f"⏭️ Tiếp theo ({len(items)} bài)",
+                            value="\n".join(lines), inline=False)
+        else:
+            embed.add_field(name="⏭️ Tiếp theo", value="_(trống)_", inline=False)
+        mode_txt = {
+            wavelink.QueueMode.normal: "Tắt",
+            wavelink.QueueMode.loop: "🔂 Lặp 1 bài",
+            wavelink.QueueMode.loop_all: "🔁 Lặp cả hàng đợi",
+        }.get(player.queue.mode, "?")
+        embed.add_field(name="Lặp", value=mode_txt)
+        embed.add_field(name="Âm lượng", value=f"{player.volume}%")
+        return embed
+
     async def _play_core(self, guild, channel, query):
         """Kết nối + tìm + phát/xếp hàng. Trả về (track|None, err|None)."""
         if not self._node_ok():
@@ -281,6 +353,33 @@ class Music(commands.Cog):
         if not player.playing:
             await player.play(player.queue.get(), volume=40)
         return track, None
+
+    async def _play_random_many(self, guild, channel, count=10):
+        """Thêm nhiều bài ngẫu nhiên (playlist ngẫu nhiên). Trả về (added, first|None, err|None)."""
+        if not self._node_ok():
+            return 0, None, "node"
+        player = await self._connect(guild, channel)
+        if not player:
+            return 0, None, "voice"
+        collected = []
+        seeds = random.sample(RANDOM_SEEDS, min(len(RANDOM_SEEDS), 4))
+        for seed in seeds:
+            res = await self._search(seed)
+            if not res:
+                continue
+            pool = list(res.tracks) if isinstance(res, wavelink.Playlist) else list(res)
+            collected.extend(pool)
+            if len(collected) >= count:
+                break
+        if not collected:
+            return 0, None, "notfound"
+        random.shuffle(collected)
+        chosen = collected[:count]
+        added = await player.queue.put_wait(chosen)
+        first = chosen[0]
+        if not player.playing:
+            await player.play(player.queue.get(), volume=40)
+        return added, first, None
 
     # ========================================================
     # 📡 SỰ KIỆN WAVELINK
@@ -406,6 +505,68 @@ class Music(commands.Cog):
         await interaction.followup.send(
             embed=self._embed(track, "🔀 Ngẫu nhiên"), view=MusicControls(self))
 
+    @app_commands.command(name="randomplaylist",
+                          description="Thêm nhiều bài ngẫu nhiên vào hàng đợi (playlist ngẫu nhiên)")
+    @app_commands.describe(count="Số bài (mặc định 10, tối đa 25)",
+                           channel="Voice channel muốn phát (tùy chọn)")
+    async def randomplaylist(self, interaction: discord.Interaction,
+                             count: app_commands.Range[int, 1, 25] = 10,
+                             channel: discord.VoiceChannel = None):
+        target = await self._target_channel(interaction.guild, interaction.user, channel)
+        if not target:
+            return await interaction.response.send_message(
+                "❌ Chọn 1 voice channel hoặc vào voice trước.", ephemeral=True)
+        await interaction.response.defer()
+        added, first, err = await self._play_random_many(interaction.guild, target, count)
+        if err:
+            return await interaction.followup.send(self._msg(err))
+        embed = discord.Embed(
+            title="🎲 Playlist ngẫu nhiên",
+            description=f"Đã thêm **{added}** bài vào hàng đợi.\nBắt đầu: **{first.title}**",
+            color=0x9b59b6)
+        await interaction.followup.send(embed=embed, view=MusicControls(self))
+
+    @app_commands.command(name="queue", description="Xem hàng đợi nhạc hiện tại")
+    async def queue_cmd(self, interaction: discord.Interaction):
+        player: wavelink.Player = interaction.guild.voice_client
+        if not player or (not player.current and player.queue.is_empty):
+            return await interaction.response.send_message("📭 Hàng đợi trống.", ephemeral=True)
+        await interaction.response.send_message(embed=self._queue_embed(player), view=MusicControls(self))
+
+    @app_commands.command(name="volume", description="Chỉnh âm lượng nhạc (0-150)")
+    @app_commands.describe(value="Mức âm lượng từ 0 đến 150 (%)")
+    async def volume(self, interaction: discord.Interaction,
+                     value: app_commands.Range[int, 0, 150]):
+        player: wavelink.Player = interaction.guild.voice_client
+        if not player:
+            return await interaction.response.send_message("❌ Bot không ở trong voice.", ephemeral=True)
+        await player.set_volume(value)
+        await interaction.response.send_message(f"🔊 Đã chỉnh âm lượng: **{value}%**", ephemeral=True)
+
+    @app_commands.command(name="loop", description="Chế độ lặp nhạc")
+    @app_commands.describe(mode="off = tắt, track = lặp 1 bài, queue = lặp cả hàng đợi")
+    @app_commands.choices(mode=[
+        app_commands.Choice(name="off", value="off"),
+        app_commands.Choice(name="track", value="track"),
+        app_commands.Choice(name="queue", value="queue"),
+    ])
+    async def loop_cmd(self, interaction: discord.Interaction, mode: app_commands.Choice[str]):
+        player: wavelink.Player = interaction.guild.voice_client
+        if not player:
+            return await interaction.response.send_message("❌ Bot không ở trong voice.", ephemeral=True)
+        mapping = {
+            "off": wavelink.QueueMode.normal,
+            "track": wavelink.QueueMode.loop,
+            "queue": wavelink.QueueMode.loop_all,
+        }
+        player.queue.mode = mapping[mode.value]
+        txt = {
+            "off": "➡️ Đã tắt lặp.",
+            "track": "🔂 Lặp lại 1 bài.",
+            "queue": "🔁 Lặp cả hàng đợi.",
+        }[mode.value]
+        await interaction.response.send_message(txt, ephemeral=True)
+
     @app_commands.command(name="panel", description="Hiện bảng điều khiển nhạc")
     async def panel(self, interaction: discord.Interaction):
         player: wavelink.Player = interaction.guild.voice_client
@@ -413,6 +574,14 @@ class Music(commands.Cog):
         if player and player.current:
             desc = f"🎧 Đang phát: **{player.current.title}**"
         embed = discord.Embed(title="🎛️ Bảng điều khiển nhạc", description=desc, color=0x9b59b6)
+        if player:
+            mode_txt = {
+                wavelink.QueueMode.normal: "Tắt",
+                wavelink.QueueMode.loop: "🔂 Lặp 1 bài",
+                wavelink.QueueMode.loop_all: "🔁 Lặp cả hàng đợi",
+            }.get(player.queue.mode, "?")
+            embed.add_field(name="Lặp", value=mode_txt)
+            embed.add_field(name="Âm lượng", value=f"{player.volume}%")
         await interaction.response.send_message(embed=embed, view=MusicControls(self))
 
     @app_commands.command(name="skip", description="Bỏ qua bài đang phát")
@@ -429,6 +598,7 @@ class Music(commands.Cog):
         player: wavelink.Player = interaction.guild.voice_client
         if player:
             player.queue.clear()
+            player.queue.mode = wavelink.QueueMode.normal
             player.autoplay = wavelink.AutoPlayMode.disabled
             if player.playing:
                 await player.skip(force=True)
