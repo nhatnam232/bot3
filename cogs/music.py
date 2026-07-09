@@ -44,8 +44,8 @@ log = logging.getLogger("bot.music")
 # ============================================================
 # ⚙️ CẤU HÌNH LAVALINK NODE
 # ============================================================
-LAVALINK_URI = os.getenv("LAVALINK_URI", "https://lavalinkv4.serenetia.com:443")
-LAVALINK_PASSWORD = os.getenv("LAVALINK_PASSWORD", "https://dsc.gg/ajidevserver")
+LAVALINK_URI = os.getenv("LAVALINK_URI", "https://lavalink.jirayu.net:443")
+LAVALINK_PASSWORD = os.getenv("LAVALINK_PASSWORD", "youshallnotpass")
 
 # Thông báo dùng chung
 NODE_ERR = (
@@ -315,7 +315,14 @@ class Music(commands.Cog):
         return None
 
     async def _connect(self, guild, channel):
-        """Kết nối/di chuyển Lavalink player tới voice channel. None nếu lỗi."""
+        """Kết nối/di chuyển Lavalink player tới voice channel. None nếu lỗi.
+        wavelink.Player BẮT BUỘC cần ít nhất 1 Lavalink node đã ready mới
+        connect voice thành công — đây không phải vấn đề quyền của bot."""
+        if not self._node_ok():
+            log.warning(
+                "Không thể connect voice guild=%s: chưa có Lavalink node nào sẵn sàng.",
+                guild.id)
+            return None
         player: wavelink.Player = guild.voice_client
         try:
             if player is None:
@@ -737,6 +744,32 @@ class Music(commands.Cog):
                        view=MusicControls(self))
 
 
+async def _connect_lavalink_background(bot: commands.Bot):
+    """Kết nối Lavalink trong nền, KHÔNG chặn bot khởi động.
+    Nếu Lavalink sập/timeout, bot vẫn login & online bình thường,
+    chỉ các tính năng liên quan voice (join/247/play/...) sẽ báo lỗi tạm thời
+    cho tới khi Lavalink kết nối được, vì wavelink.Player bắt buộc phải có
+    node Lavalink ready mới connect voice thành công (không thể tách rời)."""
+    try:
+        node = wavelink.Node(uri=LAVALINK_URI, password=LAVALINK_PASSWORD)
+        log.info("🎶 Đang thử kết nối Lavalink (nền): %s", LAVALINK_URI)
+        await asyncio.wait_for(
+            wavelink.Pool.connect(nodes=[node], client=bot, cache_capacity=100),
+            timeout=15,
+        )
+        log.info("✅ Lavalink kết nối thành công: %s", LAVALINK_URI)
+    except asyncio.TimeoutError:
+        log.warning(
+            "⏱️ Lavalink không phản hồi sau 15s (node có thể đang sập). "
+            "Bot vẫn chạy bình thường, chỉ tính năng nhạc tạm thời không dùng được."
+        )
+    except Exception:
+        log.exception(
+            "❌ Không kết nối được Lavalink pool. "
+            "Bot vẫn chạy bình thường, chỉ tính năng nhạc tạm thời không dùng được."
+        )
+
+
 async def setup(bot: commands.Bot):
     cog = Music(bot)
     await bot.add_cog(cog)
@@ -745,10 +778,7 @@ async def setup(bot: commands.Bot):
         bot.add_view(MusicControls(cog))
     except Exception:
         log.exception("Không đăng ký được MusicControls view")
-    # Kết nối tới Lavalink node
-    try:
-        node = wavelink.Node(uri=LAVALINK_URI, password=LAVALINK_PASSWORD)
-        await wavelink.Pool.connect(nodes=[node], client=bot, cache_capacity=100)
-        log.info("🎶 Đang kết nối Lavalink: %s", LAVALINK_URI)
-    except Exception:
-        log.exception("Không kết nối được Lavalink pool")
+    # Kết nối tới Lavalink node — chạy NỀN (không await trực tiếp) để KHÔNG
+    # chặn setup_hook()/bot.start(). Nếu node sập, bot vẫn login & online
+    # bình thường; wavelink sẽ tự retry kết nối ở background task này.
+    asyncio.create_task(_connect_lavalink_background(bot))
